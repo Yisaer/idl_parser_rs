@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod decoder;
 pub mod parser;
 
 /// Parse IDL source code into a Module AST.
