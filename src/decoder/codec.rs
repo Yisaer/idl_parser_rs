@@ -111,7 +111,7 @@ impl Decoder {
     }
 
     /// Decode a length-prefixed sequence.
-    fn decode_sequence<'a>(
+    pub(super) fn decode_sequence<'a>(
         &self,
         data: &'a [u8],
         inner_type: &TypeRef,

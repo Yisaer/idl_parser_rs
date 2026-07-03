@@ -70,6 +70,50 @@ assert_eq!(fields.get("x").unwrap(), &idl_parser_rs::decoder::Value::U8(10));
 assert_eq!(fields.get("y").unwrap(), &idl_parser_rs::decoder::Value::U8(20));
 ```
 
+### Decode a GBF packet (typed API)
+
+```rust
+use idl_parser_rs::parse_idl;
+use idl_parser_rs::decoder::{Decoder, DecoderConfig};
+
+let idl = r#"
+    module spi {
+        struct frame {
+            unsigned long id;
+            unsigned long len;
+            sequence<octet> payload;
+        };
+        struct packet {
+            unsigned long long ts;
+            unsigned short len;
+            @format(dbc="spi/sim.json") sequence<frame> frames;
+        };
+    }
+"#;
+let module = parse_idl(idl).unwrap();
+let mut decoder = Decoder::new(DecoderConfig::default(), module).unwrap();
+
+// Binary GBF packet: ts=100, 1 frame (id=1264, payload=[1,2,3])
+let mut data = Vec::new();
+data.extend_from_slice(&100u64.to_be_bytes());
+data.extend_from_slice(&[0x00, 0x00]);  // len
+let frame_bytes = [
+    &1264u32.to_be_bytes()[..],
+    &3u32.to_be_bytes()[..],
+    &3u32.to_be_bytes()[..],
+    &[0x01, 0x02, 0x03][..],
+].concat();
+data.extend_from_slice(&(frame_bytes.len() as u32).to_be_bytes());
+data.extend_from_slice(&frame_bytes);
+
+let packet = decoder.decode_packet("packet", &data).unwrap();
+assert_eq!(packet.ts, 100);
+assert_eq!(packet.frames.len(), 1);
+assert_eq!(packet.frames[0].can_id, 1264);
+assert_eq!(packet.frames[0].payload, vec![1, 2, 3]);
+assert_eq!(packet.frames[0].format_annotation, Some("spi/sim.json".into()));
+```
+
 ## Public API
 
 ### Parsing
@@ -87,17 +131,23 @@ pub struct Decoder;
 pub struct DecoderConfig { ... }
 pub enum Value { U8, I16, U16, I32, U32, I64, U64, F32, F64, Bool, Str, List, Struct, Bytes }
 pub enum DecoderError { ... }
+pub struct DecodedFrame { pub can_id: u32, pub payload: Vec<u8>, pub len: u32, pub format_annotation: Option<String> }
+pub struct DecodedPacket { pub ts: u64, pub frames: Vec<DecodedFrame> }
 
 impl Decoder {
     pub fn new(config: DecoderConfig, module: Module) -> Result<Self, DecoderError>;
+    /// Generic decode: returns HashMap<String, Value>
     pub fn decode(&mut self, schema_id: &str, data: &[u8]) -> Result<HashMap<String, Value>, DecoderError>;
+    /// Typed GBF packet decode: returns DecodedPacket with extracted frames
+    pub fn decode_packet(&mut self, schema_id: &str, data: &[u8]) -> Result<DecodedPacket, DecoderError>;
 }
 ```
 
 - **`Decoder::new`** — Create a decoder from a parsed `Module` and configuration.
-- **`Decoder::decode`** — Decode `&[u8]` using the struct identified by `schema_id` (e.g., `"Point"` or `"spi.packet"`).
+- **`Decoder::decode`** — Decode `&[u8]` into `HashMap<String, Value>` (generic API).
+- **`Decoder::decode_packet`** — Decode a GBF packet into `DecodedPacket`, with frames extracted as typed `DecodedFrame` structs. Carries `@format(dbc="...")` annotation through to each frame for downstream `arxml_converter_rs` handoff. **Preferred API for veloFlux GBF streams.**
 
-See [API Reference](docs/api-reference.md) for full details on `DecoderConfig`, `Value`, and `DecoderError`.
+See [API Reference](docs/api-reference.md) for full details on all types and methods.
 
 ## Supported IDL Grammar
 
@@ -169,7 +219,7 @@ idl_parser_rs/
 │       └── string.rs       # BOM-aware string decoder (UTF-8/UTF-16)
 ├── tests/
 │   ├── parser_tests.rs     # 46 parser integration tests
-│   └── decoder_tests.rs    # 76 decoder integration tests
+│   └── decoder_tests.rs    # 83 decoder integration tests (incl. 7 decode_packet tests)
 ├── docs/
 │   ├── phase1-parser.md    # Parser design document
 │   ├── phase2-decoder.md   # Decoder design document
@@ -184,7 +234,7 @@ idl_parser_rs/
 ```bash
 make build      # Debug build
 make release    # Optimized build
-make test       # Run all 122 tests
+make test       # Run all 130 tests
 make fmt        # Format code
 make clippy     # Lint with -D warnings
 make check      # fmt + clippy + test

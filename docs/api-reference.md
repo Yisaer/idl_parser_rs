@@ -19,6 +19,9 @@ It is intended for developers and AI coding agents integrating this crate.
   - [`TypeRef`](#typeref)
 - [Decoding](#decoding)
   - [`Decoder`](#decoder)
+  - [`decode_packet`](#decode_packet)
+  - [`DecodedPacket`](#decodedpacket)
+  - [`DecodedFrame`](#decodedframe)
   - [`DecoderConfig`](#decoderconfig)
   - [`Value`](#value)
   - [`DecoderError`](#decodererror)
@@ -240,6 +243,58 @@ impl Decoder {
   to align to `padding_length` boundary.
 - `header_length` bytes are skipped before decoding begins.
 
+### `decode_packet`
+
+```rust
+impl Decoder {
+    pub fn decode_packet(
+        &mut self,
+        schema_id: &str,
+        data: &[u8],
+    ) -> Result<DecodedPacket, DecoderError>;
+}
+```
+
+Typed GBF packet decode. This is the **preferred API for veloFlux GBF streams**.
+It decodes the outer packet struct and extracts frames into typed structures,
+carrying `@format(dbc="...")` annotations through to each frame.
+
+**How it works:**
+1. Locates the target struct via `schema_id` (e.g., `"spi.packet"`).
+2. Decodes fields sequentially: extracts `ts` (u64), skips `len` (u16),
+   decodes the `sequence<frame>` field.
+3. For each frame in the sequence, extracts `id`, `len`, `payload`.
+4. Looks up the `@format(dbc="...")` annotation on the sequence field
+   in the AST and attaches it to every `DecodedFrame`.
+5. Returns a typed `DecodedPacket`.
+
+### `DecodedPacket`
+
+```rust
+pub struct DecodedPacket {
+    /// Timestamp from the packet header (unsigned long long).
+    pub ts: u64,
+    /// Decoded CAN frames.
+    pub frames: Vec<DecodedFrame>,
+}
+```
+
+### `DecodedFrame`
+
+```rust
+pub struct DecodedFrame {
+    /// CAN frame ID (from the frame's `id` field).
+    pub can_id: u32,
+    /// Raw payload bytes (from the frame's `payload` field).
+    pub payload: Vec<u8>,
+    /// Byte length of the payload (from the frame's `len` field).
+    pub len: u32,
+    /// Value of `@format(dbc="...")` annotation from the outer sequence field.
+    /// `None` if no `@format` annotation is present.
+    pub format_annotation: Option<String>,
+}
+```
+
 ### `DecoderConfig`
 
 ```rust
@@ -375,19 +430,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Integration with arxml_converter_rs
 
-When a `sequence<frame>` field has a `@format(dbc="...")` annotation, veloFlux does:
+Use `decode_packet` for type-safe frame extraction with automatic annotation propagation:
 
 ```rust
-// 1. Decode outer packet structure with idl_parser_rs
-let fields = idl_decoder.decode("spi.packet", &binary_data)?;
+// 1. Decode the GBF packet with typed API
+let packet = idl_decoder.decode_packet("spi.packet", &binary_data)?;
 
-// 2. Iterate frames and extract (can_id, payload) pairs
+// 2. Iterate frames — each has can_id, payload, and format_annotation
+for frame in &packet.frames {
+    if let Some(dbc_path) = &frame.format_annotation {
+        // 3. Decode CAN signals with arxml_converter_rs
+        let signals = arxml_converter.decode(frame.can_id, &frame.payload)?;
+        // merge signals into output record
+    }
+}
+```
+
+Alternatively, use the generic `decode` API for manual extraction:
+
+```rust
+let fields = idl_decoder.decode("spi.packet", &binary_data)?;
 if let Value::List(frames) = &fields["frames"] {
     for frame in frames {
         if let Value::Struct(f) = frame {
             let can_id = /* extract from f["id"] */;
-            let payload = /* extract from f["payload"] as &[u8] */;
-            // 3. Decode CAN signals with arxml_converter_rs
+            let payload = /* extract from f["payload"] */;
             let signals = arxml_converter.decode(can_id, payload)?;
         }
     }

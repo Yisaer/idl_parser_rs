@@ -148,7 +148,95 @@ impl Decoder {
         schema_id: &str,
         data: &[u8],
     ) -> Result<HashMap<String, Value>, DecoderError> {
-        // 1. Skip header_length bytes
+        let data = self.prepare_data(data)?;
+        let (target_struct, _target_module) = self.travel_module(schema_id)?;
+        let (result, _remaining) = self.decode_struct(data, &target_struct)?;
+        Ok(result)
+    }
+
+    /// Decode a GBF packet into a typed `DecodedPacket`.
+    ///
+    /// This is the preferred API for veloFlux GBF stream processing.
+    /// It decodes the outer packet fields (`ts`, `len`) and extracts
+    /// each CAN frame's (`id`, `len`, `payload`) into a typed structure,
+    /// carrying forward any `@format(dbc="...")` annotation from the
+    /// sequence field for downstream `arxml_converter_rs` signal decoding.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let packet = decoder.decode_packet("spi.packet", &binary_data)?;
+    /// for frame in &packet.frames {
+    ///     if let Some(dbc) = &frame.format_annotation {
+    ///         let signals = arxml_converter.decode(frame.can_id, &frame.payload)?;
+    ///     }
+    /// }
+    /// ```
+    pub fn decode_packet(
+        &mut self,
+        schema_id: &str,
+        data: &[u8],
+    ) -> Result<DecodedPacket, DecoderError> {
+        let data = self.prepare_data(data)?;
+        let (target_struct, _) = self.travel_module(schema_id)?;
+
+        // Extract @format annotation from the sequence field
+        let format_annotation = Self::find_format_annotation(&target_struct);
+
+        // Decode fields sequentially
+        let mut remaining = data;
+        let mut ts: Option<u64> = None;
+        let mut frames: Option<Vec<DecodedFrame>> = None;
+
+        for field in &target_struct.fields {
+            match &field.field_type {
+                TypeRef::UnsignedLongLong => {
+                    let (val, rest) = self.decode_u64(remaining)?;
+                    ts = match val {
+                        Value::U64(v) => Some(v),
+                        _ => unreachable!(),
+                    };
+                    remaining = rest;
+                }
+                TypeRef::UnsignedShort => {
+                    let (_val, rest) = self.decode_u16(remaining)?;
+                    // len field — consume but not needed in output
+                    remaining = rest;
+                }
+                TypeRef::Sequence { inner } => {
+                    let (seq_val, rest) = self.decode_sequence(remaining, inner.as_ref())?;
+                    frames = Some(Self::extract_frames(&seq_val, &format_annotation)?);
+                    remaining = rest;
+
+                    // Apply padding after variable-length field
+                    if self.needs_padding(&field.field_type) && !remaining.is_empty() {
+                        remaining = self.consume_padding(remaining)?;
+                    }
+                }
+                _ => {
+                    // Other fields: decode and skip (not needed for packet output)
+                    let (_val, rest) = self.decode_by_type(remaining, &field.field_type)?;
+                    remaining = rest;
+
+                    if self.needs_padding(&field.field_type) && !remaining.is_empty() {
+                        remaining = self.consume_padding(remaining)?;
+                    }
+                }
+            }
+        }
+
+        let ts = ts.ok_or_else(|| {
+            DecoderError::InvalidData("packet missing 'ts' (unsigned long long) field".into())
+        })?;
+        let frames = frames.ok_or_else(|| {
+            DecoderError::InvalidData("packet missing 'frames' (sequence) field".into())
+        })?;
+
+        Ok(DecodedPacket { ts, frames })
+    }
+
+    /// Skip header bytes and set total_bytes for padding calculation.
+    fn prepare_data<'a>(&mut self, data: &'a [u8]) -> Result<&'a [u8], DecoderError> {
         let data = if self.config.header_length > 0 {
             if data.len() < self.config.header_length {
                 return Err(DecoderError::UnexpectedEndOfInput {
@@ -160,16 +248,103 @@ impl Decoder {
         } else {
             data
         };
-
         self.total_bytes = data.len() + self.config.header_length;
-
-        // 2. Navigate to target struct
-        let (target_struct, _target_module) = self.travel_module(schema_id)?;
-
-        // 3. Decode
-        let (result, _remaining) = self.decode_struct(data, &target_struct)?;
-        Ok(result)
+        Ok(data)
     }
+
+    /// Extract the `@format(dbc="...")` annotation value from the first
+    /// sequence field in the struct definition.
+    fn find_format_annotation(st: &Struct) -> Option<String> {
+        for field in &st.fields {
+            if matches!(field.field_type, TypeRef::Sequence { .. }) {
+                for anno in &field.annotations {
+                    if anno.name == "format" {
+                        return anno.values.get("dbc").cloned();
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract `DecodedFrame` list from a decoded sequence value.
+    fn extract_frames(
+        seq_val: &Value,
+        format_annotation: &Option<String>,
+    ) -> Result<Vec<DecodedFrame>, DecoderError> {
+        match seq_val {
+            Value::List(items) => items
+                .iter()
+                .map(|item| match item {
+                    Value::Struct(fields) => {
+                        let can_id = match fields.get("id") {
+                            Some(Value::U32(v)) => *v,
+                            _ => {
+                                return Err(DecoderError::InvalidData(
+                                    "frame missing 'id' field".into(),
+                                ))
+                            }
+                        };
+                        let len = match fields.get("len") {
+                            Some(Value::U32(v)) => *v,
+                            _ => {
+                                return Err(DecoderError::InvalidData(
+                                    "frame missing 'len' field".into(),
+                                ))
+                            }
+                        };
+                        let payload = match fields.get("payload") {
+                            Some(Value::Bytes(b)) => b.clone(),
+                            _ => {
+                                return Err(DecoderError::InvalidData(
+                                    "frame missing 'payload' field".into(),
+                                ))
+                            }
+                        };
+                        Ok(DecodedFrame {
+                            can_id,
+                            payload,
+                            len,
+                            format_annotation: format_annotation.clone(),
+                        })
+                    }
+                    _ => Err(DecoderError::InvalidData(
+                        "expected struct for frame".into(),
+                    )),
+                })
+                .collect(),
+            _ => Err(DecoderError::InvalidData(
+                "expected List for frames sequence".into(),
+            )),
+        }
+    }
+}
+
+// ============================================================================
+// Typed decode output types
+// ============================================================================
+
+/// A single decoded CAN frame, ready for signal-level decoding by `arxml_converter_rs`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedFrame {
+    /// CAN frame ID (from the frame's `id` field).
+    pub can_id: u32,
+    /// Raw payload bytes (from the frame's `payload` field).
+    pub payload: Vec<u8>,
+    /// Byte length of the payload (from the frame's `len` field).
+    pub len: u32,
+    /// Value of `@format(dbc="...")` annotation from the outer sequence field,
+    /// e.g., `Some("spi/sim.json")`. `None` if no `@format` annotation is present.
+    pub format_annotation: Option<String>,
+}
+
+/// A decoded GBF packet with timestamp and CAN frames.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedPacket {
+    /// Timestamp from the packet header.
+    pub ts: u64,
+    /// Decoded CAN frames.
+    pub frames: Vec<DecodedFrame>,
 }
 
 impl DecoderConfig {

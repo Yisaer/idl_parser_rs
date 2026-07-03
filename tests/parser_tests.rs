@@ -5,7 +5,6 @@
 
 use idl_parser_rs::ast::*;
 use idl_parser_rs::parse_idl;
-use std::collections::HashMap;
 
 // ============================================================================
 // TestParsing (Go: TestParsing)
