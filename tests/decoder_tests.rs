@@ -1703,3 +1703,236 @@ fn test_s1_chinese_wifi_end_to_end() {
         _ => panic!("expected List"),
     }
 }
+
+// ============================================================================
+// decode_packet API tests
+// ============================================================================
+
+fn make_gbf_idl() -> &'static str {
+    r#"
+        module spi {
+            struct frame {
+                unsigned long id;
+                unsigned long len;
+                sequence<octet> payload;
+            };
+            struct packet {
+                unsigned long long ts;
+                unsigned short len;
+                sequence<frame> frames;
+            };
+        }
+    "#
+}
+
+fn make_gbf_idl_with_annotation() -> &'static str {
+    r#"
+        module spi {
+            struct frame {
+                unsigned long id;
+                unsigned long len;
+                sequence<octet> payload;
+            };
+            struct packet {
+                unsigned long long ts;
+                unsigned short len;
+                @format(dbc="spi/sim.json") sequence<frame> frames;
+            };
+        }
+    "#
+}
+
+/// Build binary data for a single-frame packet.
+/// ts=100, len=0, frame: id=1264, len=3, payload=[1,2,3]
+fn build_single_frame_packet() -> Vec<u8> {
+    let mut data = Vec::new();
+    // ts: u64 = 100
+    data.extend_from_slice(&100u64.to_be_bytes());
+    // len: u16 = 0
+    data.extend_from_slice(&[0x00, 0x00]);
+
+    // Build one frame
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&1264u32.to_be_bytes()); // id
+    frame.extend_from_slice(&3u32.to_be_bytes()); // len
+    frame.extend_from_slice(&3u32.to_be_bytes()); // payload seq length
+    frame.extend_from_slice(&[0x01, 0x02, 0x03]); // payload
+
+    // frames sequence: 4-byte length + frame bytes
+    data.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+    data.extend_from_slice(&frame);
+    data
+}
+
+/// Build binary data for a multi-frame packet (3 frames).
+fn build_multi_frame_packet() -> Vec<u8> {
+    let mut data = Vec::new();
+    // ts: u64 = 200
+    data.extend_from_slice(&200u64.to_be_bytes());
+    // len: u16 = 0
+    data.extend_from_slice(&[0x00, 0x00]);
+
+    let build_frame = |id: u32, payload: &[u8]| -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&id.to_be_bytes());
+        f.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        f.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    };
+
+    let f1 = build_frame(0x24A, &[0xAA, 0xBB]);
+    let f2 = build_frame(0x4F0, &[0x11, 0x22, 0x33, 0x44]);
+    let f3 = build_frame(0x586, &[0xFF]);
+
+    let all_frames: Vec<u8> = [f1.as_slice(), f2.as_slice(), f3.as_slice()].concat();
+    data.extend_from_slice(&(all_frames.len() as u32).to_be_bytes());
+    data.extend_from_slice(&all_frames);
+    data
+}
+
+#[test]
+fn test_decode_packet_single_frame() {
+    let module = parse_idl(make_gbf_idl()).unwrap();
+    let mut dec = Decoder::new(DecoderConfig::default(), module).unwrap();
+    let data = build_single_frame_packet();
+
+    let packet = dec.decode_packet("packet", &data).unwrap();
+
+    assert_eq!(packet.ts, 100);
+    assert_eq!(packet.frames.len(), 1);
+
+    let frame = &packet.frames[0];
+    assert_eq!(frame.can_id, 1264);
+    assert_eq!(frame.len, 3);
+    assert_eq!(frame.payload, vec![1, 2, 3]);
+    assert_eq!(frame.format_annotation, None);
+}
+
+#[test]
+fn test_decode_packet_multi_frame() {
+    let module = parse_idl(make_gbf_idl()).unwrap();
+    let mut dec = Decoder::new(DecoderConfig::default(), module).unwrap();
+    let data = build_multi_frame_packet();
+
+    let packet = dec.decode_packet("packet", &data).unwrap();
+
+    assert_eq!(packet.ts, 200);
+    assert_eq!(packet.frames.len(), 3);
+
+    // Frame 1
+    assert_eq!(packet.frames[0].can_id, 0x24A);
+    assert_eq!(packet.frames[0].len, 2);
+    assert_eq!(packet.frames[0].payload, vec![0xAA, 0xBB]);
+
+    // Frame 2
+    assert_eq!(packet.frames[1].can_id, 0x4F0);
+    assert_eq!(packet.frames[1].len, 4);
+    assert_eq!(packet.frames[1].payload, vec![0x11, 0x22, 0x33, 0x44]);
+
+    // Frame 3
+    assert_eq!(packet.frames[2].can_id, 0x586);
+    assert_eq!(packet.frames[2].len, 1);
+    assert_eq!(packet.frames[2].payload, vec![0xFF]);
+}
+
+#[test]
+fn test_decode_packet_with_format_annotation() {
+    let module = parse_idl(make_gbf_idl_with_annotation()).unwrap();
+    let mut dec = Decoder::new(DecoderConfig::default(), module).unwrap();
+    let data = build_single_frame_packet();
+
+    let packet = dec.decode_packet("packet", &data).unwrap();
+
+    assert_eq!(packet.frames.len(), 1);
+    assert_eq!(
+        packet.frames[0].format_annotation,
+        Some("spi/sim.json".to_string())
+    );
+}
+
+#[test]
+fn test_decode_packet_no_format_annotation() {
+    // IDL without @format annotation
+    let module = parse_idl(make_gbf_idl()).unwrap();
+    let mut dec = Decoder::new(DecoderConfig::default(), module).unwrap();
+    let data = build_single_frame_packet();
+
+    let packet = dec.decode_packet("packet", &data).unwrap();
+
+    assert_eq!(packet.frames[0].format_annotation, None);
+}
+
+#[test]
+fn test_decode_packet_insufficient_data() {
+    let module = parse_idl(make_gbf_idl()).unwrap();
+    let mut dec = Decoder::new(DecoderConfig::default(), module).unwrap();
+
+    // Only 4 bytes — not enough for ts (8 bytes)
+    let result = dec.decode_packet("packet", &[0x00, 0x00, 0x00, 0x01]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_decode_packet_empty_frames() {
+    let idl = r#"
+        module spi {
+            struct frame {
+                unsigned long id;
+                unsigned long len;
+                sequence<octet> payload;
+            };
+            struct packet {
+                unsigned long long ts;
+                unsigned short len;
+                sequence<frame> frames;
+            };
+        }
+    "#;
+    let module = parse_idl(idl).unwrap();
+    let mut dec = Decoder::new(DecoderConfig::default(), module).unwrap();
+
+    let mut data = Vec::new();
+    // ts = 42
+    data.extend_from_slice(&42u64.to_be_bytes());
+    // len = 0
+    data.extend_from_slice(&[0x00, 0x00]);
+    // empty sequence: length = 0
+    data.extend_from_slice(&0u32.to_be_bytes());
+
+    let packet = dec.decode_packet("packet", &data).unwrap();
+    assert_eq!(packet.ts, 42);
+    assert!(packet.frames.is_empty());
+}
+
+#[test]
+fn test_decode_packet_nested_module_path() {
+    let idl = r#"
+        module outer {
+            module spi {
+                struct frame {
+                    unsigned long id;
+                    unsigned long len;
+                    sequence<octet> payload;
+                };
+                struct packet {
+                    unsigned long long ts;
+                    unsigned short len;
+                    @format(dbc="nested.json") sequence<frame> frames;
+                };
+            };
+        }
+    "#;
+    let module = parse_idl(idl).unwrap();
+    let mut dec = Decoder::new(DecoderConfig::default(), module).unwrap();
+    let data = build_single_frame_packet();
+
+    // Use full path through nested modules
+    let packet = dec.decode_packet("outer.spi.packet", &data).unwrap();
+    assert_eq!(packet.ts, 100);
+    assert_eq!(packet.frames.len(), 1);
+    assert_eq!(
+        packet.frames[0].format_annotation,
+        Some("nested.json".to_string())
+    );
+}

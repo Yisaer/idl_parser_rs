@@ -1,0 +1,9 @@
+module a {
+    module b {
+        struct complex {
+            short id;
+            long timestamp;
+            float value;
+        }
+    };
+}
